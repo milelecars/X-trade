@@ -2,13 +2,35 @@
 REAL-TIME CRYPTO SCANNER - Binance WebSocket (Windows Compatible)
 TRUE real-time monitoring - alerts sent THE SECOND signal triggers
 
-SIGNAL LOGIC — Logic No. 2b (MA44 Bounce, no RSI, no crossovers):
-  SHORT: A bearish (red) candle forms directly below a MA44 that has been
-         continuously falling for each of the last 4 candles.
-         Body must be strictly below MA44 (no sloppiness).
-         Wick (high-low) >= 0.35%.  Body top within 0.75% of MA44.
-  LONG:  Mirror of above — bullish candle above a continuously rising MA44.
-  Entry: Open of the NEXT candle after the validation candle closes.
+SIGNAL LOGIC — 3-Layer (btc_backtest, Layer 1 sideways filter removed):
+
+  LAYER 2 — Cross confirmation (last 8 candles):
+    LONG : EMA9 freshly crossed above MA44 within last 8 candles
+           AND EMA26 is currently above MA44 (already there is fine)
+    SHORT: EMA9 freshly crossed below MA44 within last 8 candles
+           AND EMA26 is currently below MA44 (already there is fine)
+    (Relaxed: 1 freshly crossed + the other already on correct side)
+
+  LAYER 3 — Setup candle (candle that just closed):
+    LONG:
+      1. RSI 45.1–85
+      2. EMA9 > EMA26
+      3. EMA9 > MA44  AND  EMA26 > MA44
+      4. Bullish candle (close > open)
+      5. Close > EMA9, EMA26, MA44
+
+    SHORT:
+      1. RSI 10–55
+      2. EMA9 < EMA26
+      3. EMA9 < MA44  AND  EMA26 < MA44
+      4. Bearish candle (close < open)
+      5. Close < EMA9, EMA26, MA44
+
+  LAYER 4 — Trigger candle (fires at open of NEXT candle):
+    LONG : MA44(setup) > MA44(3 candles before setup)  AND  open > setup open
+    SHORT: MA44(setup) < MA44(3 candles before setup)  AND  open < setup open
+    Entry = open of trigger candle
+
   Cooldown: 2 hours 30 minutes per symbol.
 
 - WebSocket streaming (instant price updates)
@@ -46,20 +68,26 @@ class Config:
     TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "YOUR_BOT_TOKEN_HERE")
     TELEGRAM_CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID", "")
 
+    # ── Strategy Parameters (3-Layer Logic — no sideways filter) ──────────
+    MA_PERIOD          = 44
+    EMA_SHORT          = 9
+    EMA_LONG           = 26
+    RSI_PERIOD         = 14
 
-    # ── Strategy Parameters (Logic No. 2b — MA44 Bounce) ──────────────────
-    MA_PERIOD      = 44
-    SL_PERCENT     = 0.5
-    TP_PERCENT     = 1.5
+    RSI_LONG_MIN       = 45.1
+    RSI_LONG_MAX       = 85
+    RSI_SHORT_MIN      = 10
+    RSI_SHORT_MAX      = 55       # expanded from 45 to catch sharp drops
 
-    # Validation candle filters
-    MIN_WICK_PCT   = 0.0035   # 0.35% wick (high-to-low) minimum
-    MAX_DIST_PCT   = 0.0075   # 0.75% max distance of body edge from MA44
-    SLOPE_LOOKBACK = 4        # MA44 must be continuously falling/rising for 4 candles
+    SL_PERCENT         = 0.5
+    TP_PERCENT         = 1.5
+
+    CROSS_LOOKBACK     = 8        # candles to look back for EMA/MA44 cross
+    SLOPE_CANDLES      = 3        # MA44 slope: compare now vs 3 candles back
 
     # Real-time Settings
     CANDLE_INTERVAL = '15m'
-    HISTORY_BARS    = 100
+    HISTORY_BARS    = 150         # enough warmup for all indicators
 
     # Alert Settings
     ALERT_COOLDOWN      = 150 * 60   # 2h30m in seconds (150 minutes)
@@ -143,14 +171,33 @@ class IndicatorEngine:
             return closes[-1] if closes else 0.0
         return sum(closes[-period:]) / period
 
+    @staticmethod
+    def calculate_ema(closes: list, period: int) -> float:
+        if len(closes) < period:
+            return closes[-1] if closes else 0.0
+        prices = pd.Series(closes)
+        return float(prices.ewm(span=period, adjust=False).mean().iloc[-1])
+
+    @staticmethod
+    def calculate_rsi(closes: list, period: int = 14) -> float:
+        if len(closes) < period + 1:
+            return 50.0
+        prices = pd.Series(closes)
+        delta  = prices.diff()
+        gain   = delta.where(delta > 0, 0).rolling(window=period).mean()
+        loss   = (-delta.where(delta < 0, 0)).rolling(window=period).mean()
+        rs     = gain / loss
+        rsi    = 100 - (100 / (1 + rs))
+        return float(rsi.iloc[-1])
+
 # ============================================================================
 # CANDLE MANAGER
 # ============================================================================
 
 class CandleManager:
-    """Manages real-time candle data — Logic No. 2b (MA44 Bounce)"""
+    """Manages real-time candle data — 3-Layer Signal Logic (no sideways filter)"""
 
-    def __init__(self, symbol: str, max_bars: int = 100):
+    def __init__(self, symbol: str, max_bars: int = 150):
         self.symbol   = symbol
         self.max_bars = max_bars
 
@@ -165,11 +212,11 @@ class CandleManager:
         self.last_alert_time = 0
 
         # ── Signal State ──────────────────────────────────────────────────────
-        # When a validation candle passes all conditions, we set setup_pending
-        # and fire the entry on the OPEN of the very next candle.
+        # Layer 2+3 (setup candle) sets setup_pending = True.
+        # Layer 4 (trigger candle) fires entry on the NEXT candle open.
         self.setup_pending      = False
         self.pending_signal     = None    # 'LONG' or 'SHORT'
-        self.pending_setup_data = None    # {'ma44': float}
+        self.pending_setup_data = None    # {'ma44': float, 'setup_open': float}
         # ─────────────────────────────────────────────────────────────────────
 
         self.load_history()
@@ -260,117 +307,156 @@ class CandleManager:
         return False
 
     # =========================================================================
-    # SIGNAL LOGIC — Logic No. 2b (MA44 Bounce)
+    # SIGNAL LOGIC — 3-Layer (Layer 1 sideways filter removed)
     # Called once per closed candle (when update_tick returns True)
     # =========================================================================
 
-    def _ma44_series(self, closes_list: list) -> list:
+    def _layer2_had_cross_above_ma44(self, closes: list) -> bool:
         """
-        Return SLOPE_LOOKBACK+1 consecutive MA44 values (oldest first)
-        so we can check whether each step is strictly lower or higher.
+        Layer 2 LONG — Relaxed cross confirmation.
+        EMA9 freshly crossed above MA44 within last CROSS_LOOKBACK candles
+        AND EMA26 currently above MA44.
+        OR EMA26 freshly crossed above MA44 AND EMA9 currently above MA44.
         """
-        n      = len(closes_list)
-        series = []
-        for k in range(Config.SLOPE_LOOKBACK, -1, -1):
-            end = n - k if k > 0 else n
-            val = IndicatorEngine.calculate_sma(closes_list[:end], Config.MA_PERIOD)
-            series.append(val)
-        return series   # length = SLOPE_LOOKBACK + 1
+        if len(closes) < Config.MA_PERIOD + Config.CROSS_LOOKBACK + 2:
+            return False
 
-    def _check_validation_candle(
-        self,
-        closes_list: list,
-        opens_list:  list,
-        highs_list:  list,
-        lows_list:   list,
-    ):
+        ema9_crossed = ema26_crossed = False
+        for k in range(1, Config.CROSS_LOOKBACK + 1):
+            cn = closes[:-k + 1] if k > 1 else closes
+            cp = closes[:-k]
+            if len(cn) < Config.MA_PERIOD or len(cp) < Config.MA_PERIOD:
+                continue
+            e9n  = IndicatorEngine.calculate_ema(cn, Config.EMA_SHORT)
+            e9p  = IndicatorEngine.calculate_ema(cp, Config.EMA_SHORT)
+            e26n = IndicatorEngine.calculate_ema(cn, Config.EMA_LONG)
+            e26p = IndicatorEngine.calculate_ema(cp, Config.EMA_LONG)
+            m44n = IndicatorEngine.calculate_sma(cn, Config.MA_PERIOD)
+            m44p = IndicatorEngine.calculate_sma(cp, Config.MA_PERIOD)
+            if not ema9_crossed  and (e9p  <= m44p) and (e9n  > m44n): ema9_crossed  = True
+            if not ema26_crossed and (e26p <= m44p) and (e26n > m44n): ema26_crossed = True
+            if ema9_crossed and ema26_crossed:
+                return True
+
+        # Relaxed: 1 freshly crossed + other currently on correct side
+        ema9_now  = IndicatorEngine.calculate_ema(closes, Config.EMA_SHORT)
+        ema26_now = IndicatorEngine.calculate_ema(closes, Config.EMA_LONG)
+        ma44_now  = IndicatorEngine.calculate_sma(closes, Config.MA_PERIOD)
+        return (ema9_crossed and ema26_now > ma44_now) or (ema26_crossed and ema9_now > ma44_now)
+
+    def _layer2_had_cross_below_ma44(self, closes: list) -> bool:
         """
-        Evaluate the last closed candle as a potential validation candle.
+        Layer 2 SHORT — Relaxed cross confirmation.
+        EMA9 freshly crossed below MA44 within last CROSS_LOOKBACK candles
+        AND EMA26 currently below MA44.
+        OR EMA26 freshly crossed below MA44 AND EMA9 currently below MA44.
+        """
+        if len(closes) < Config.MA_PERIOD + Config.CROSS_LOOKBACK + 2:
+            return False
 
-        SHORT — all must pass:
-          1. Bearish candle  (close < open)
-          2. MA44 continuously falling over last 4 candles (each value < previous)
-          3. Entire body strictly below MA44  (body_top < ma44, no sloppiness)
-          4. Body top within 0.75% of MA44   ((ma44 - body_top) / ma44 <= 0.0075)
-          5. Wick >= 0.35% of high           ((high - low) / high >= 0.0035)
+        ema9_crossed = ema26_crossed = False
+        for k in range(1, Config.CROSS_LOOKBACK + 1):
+            cn = closes[:-k + 1] if k > 1 else closes
+            cp = closes[:-k]
+            if len(cn) < Config.MA_PERIOD or len(cp) < Config.MA_PERIOD:
+                continue
+            e9n  = IndicatorEngine.calculate_ema(cn, Config.EMA_SHORT)
+            e9p  = IndicatorEngine.calculate_ema(cp, Config.EMA_SHORT)
+            e26n = IndicatorEngine.calculate_ema(cn, Config.EMA_LONG)
+            e26p = IndicatorEngine.calculate_ema(cp, Config.EMA_LONG)
+            m44n = IndicatorEngine.calculate_sma(cn, Config.MA_PERIOD)
+            m44p = IndicatorEngine.calculate_sma(cp, Config.MA_PERIOD)
+            if not ema9_crossed  and (e9p  >= m44p) and (e9n  < m44n): ema9_crossed  = True
+            if not ema26_crossed and (e26p >= m44p) and (e26n < m44n): ema26_crossed = True
+            if ema9_crossed and ema26_crossed:
+                return True
 
-        LONG — mirror of above.
+        # Relaxed: 1 freshly crossed + other currently on correct side
+        ema9_now  = IndicatorEngine.calculate_ema(closes, Config.EMA_SHORT)
+        ema26_now = IndicatorEngine.calculate_ema(closes, Config.EMA_LONG)
+        ma44_now  = IndicatorEngine.calculate_sma(closes, Config.MA_PERIOD)
+        return (ema9_crossed and ema26_now < ma44_now) or (ema26_crossed and ema9_now < ma44_now)
 
+    def _layer3_check_setup_candle(self, closes: list, opens: list) -> str | None:
+        """
+        Layer 3 — Setup candle conditions (includes Layer 2).
+        No sideways filter (Layer 1 removed).
         Returns 'LONG', 'SHORT', or None.
         """
-        if len(closes_list) < Config.MA_PERIOD + Config.SLOPE_LOOKBACK + 2:
+        min_bars = Config.MA_PERIOD + Config.CROSS_LOOKBACK + 5
+        if len(closes) < min_bars:
             return None
 
-        c_close = closes_list[-1]
-        c_open  = opens_list[-1]
-        c_high  = highs_list[-1]
-        c_low   = lows_list[-1]
+        sc    = closes[-1]
+        so    = opens[-1]
+        rsi   = IndicatorEngine.calculate_rsi(closes, Config.RSI_PERIOD)
+        ema9  = IndicatorEngine.calculate_ema(closes, Config.EMA_SHORT)
+        ema26 = IndicatorEngine.calculate_ema(closes, Config.EMA_LONG)
+        ma44  = IndicatorEngine.calculate_sma(closes, Config.MA_PERIOD)
 
-        ma44 = IndicatorEngine.calculate_sma(closes_list, Config.MA_PERIOD)
-        if not ma44:
+        long_setup = (
+            self._layer2_had_cross_above_ma44(closes) and
+            Config.RSI_LONG_MIN <= rsi <= Config.RSI_LONG_MAX and
+            ema9 > ema26 and
+            ema9 > ma44 and ema26 > ma44 and
+            sc > so and
+            sc > ema9 and sc > ema26 and sc > ma44
+        )
+
+        short_setup = (
+            self._layer2_had_cross_below_ma44(closes) and
+            Config.RSI_SHORT_MIN <= rsi <= Config.RSI_SHORT_MAX and
+            ema9 < ema26 and
+            ema9 < ma44 and ema26 < ma44 and
+            sc < so and
+            sc < ema9 and sc < ema26 and sc < ma44
+        )
+
+        if long_setup:  return 'LONG'
+        if short_setup: return 'SHORT'
+        return None
+
+    def _layer4_check_trigger(self, closes: list, opens: list, direction: str) -> float | None:
+        """
+        Layer 4 — Trigger candle conditions.
+        MA44 current slope (3-candle window) + open gap vs setup open.
+        Returns entry price or None.
+        """
+        if len(closes) < Config.MA_PERIOD + Config.SLOPE_CANDLES + 2:
             return None
 
-        # MA44 monotonic slope check
-        ma44_series = self._ma44_series(closes_list)
-        continuously_down = all(
-            ma44_series[i] > ma44_series[i + 1]
-            for i in range(len(ma44_series) - 1)
+        ma44_now = IndicatorEngine.calculate_sma(closes[:-1], Config.MA_PERIOD)
+        ma44_ago = IndicatorEngine.calculate_sma(
+            closes[-(Config.SLOPE_CANDLES + 2):-1], Config.MA_PERIOD
         )
-        continuously_up = all(
-            ma44_series[i] < ma44_series[i + 1]
-            for i in range(len(ma44_series) - 1)
-        )
+        topen = opens[-1]   # trigger candle open (candle that just started)
+        sopen = opens[-2]   # setup candle open
 
-        body_top    = max(c_open, c_close)
-        body_bottom = min(c_open, c_close)
-        wick_pct    = (c_high - c_low) / c_high
-        dist_abs    = ma44 * Config.MAX_DIST_PCT
-
-        # ── SHORT ─────────────────────────────────────────────────────────────
-        if c_close < c_open:
-            if (
-                continuously_down and
-                body_top < ma44 and
-                (ma44 - body_top) <= dist_abs and
-                wick_pct >= Config.MIN_WICK_PCT
-            ):
-                return 'SHORT'
-
-        # ── LONG ──────────────────────────────────────────────────────────────
-        if c_close > c_open:
-            if (
-                continuously_up and
-                body_bottom > ma44 and
-                (body_bottom - ma44) <= dist_abs and
-                wick_pct >= Config.MIN_WICK_PCT
-            ):
-                return 'LONG'
-
+        if direction == 'LONG'  and ma44_now > ma44_ago and topen > sopen: return topen
+        if direction == 'SHORT' and ma44_now < ma44_ago and topen < sopen: return topen
         return None
 
     def check_signal(self) -> tuple:
         """
         Called on every newly closed candle.
 
-        STEP A — Entry fire (validation candle was the previous bar):
-            The new candle has just opened.
-            Entry = open of this new candle (current_candle['open']).
-            Fire the signal now.
+        STEP A — Layer 4 trigger (setup candle was the previous bar):
+            Check MA44 slope and open gap on the candle that just opened.
+            If passes → fire entry at this candle's open.
 
-        STEP B — Validation check (candle that just closed):
-            Run _check_validation_candle() on the closed candle.
-            If it passes → mark setup_pending = True.
-            Entry will fire on the NEXT call to check_signal (Step A).
+        STEP B — Layer 3 setup check (candle that just closed):
+            Layers 2+3 run on the closed candle.
+            If passes → mark setup_pending = True.
+            Layer 4 fires on the NEXT call (Step A).
         """
-        if len(self.closes) < Config.MA_PERIOD + Config.SLOPE_LOOKBACK + 5:
+        min_bars = Config.MA_PERIOD + Config.CROSS_LOOKBACK + 10
+        if len(self.closes) < min_bars:
             return None, None
 
         closes_list = list(self.closes)
         opens_list  = list(self.opens)
-        highs_list  = list(self.highs)
-        lows_list   = list(self.lows)
 
-        # ── STEP A: fire entry if last candle was a validation candle ─────────
+        # ── STEP A: attempt Layer 4 trigger if setup is pending ───────────────
         if self.setup_pending and self.pending_signal and self.pending_setup_data:
 
             # Cooldown guard (2h30m)
@@ -387,12 +473,17 @@ class CandleManager:
             signal     = self.pending_signal
             setup_data = self.pending_setup_data
 
-            # Entry = open of the candle that just started
-            entry = (
-                self.current_candle['open']
-                if self.current_candle
-                else opens_list[-1]
-            )
+            entry = self._layer4_check_trigger(closes_list, opens_list, signal)
+
+            if entry is None:
+                logger.info(
+                    f"{self.symbol}: {signal} setup cancelled — "
+                    f"Layer 4 (MA44 slope / open gap) did not confirm"
+                )
+                self.setup_pending      = False
+                self.pending_signal     = None
+                self.pending_setup_data = None
+                return None, None
 
             if signal == 'LONG':
                 alert_data = {
@@ -416,19 +507,20 @@ class CandleManager:
 
             return signal, alert_data
 
-        # ── STEP B: check if candle that just closed is a validation candle ───
-        direction = self._check_validation_candle(
-            closes_list, opens_list, highs_list, lows_list
-        )
+        # ── STEP B: check if candle that just closed is a setup candle ────────
+        direction = self._layer3_check_setup_candle(closes_list, opens_list)
 
         if direction is not None:
             ma44_now = IndicatorEngine.calculate_sma(closes_list, Config.MA_PERIOD)
             self.setup_pending      = True
             self.pending_signal     = direction
-            self.pending_setup_data = {'ma44': ma44_now}
+            self.pending_setup_data = {
+                'ma44':       ma44_now,
+                'setup_open': opens_list[-1],
+            }
             logger.info(
-                f"{self.symbol}: {direction} validation candle — "
-                f"entry fires on next candle open  (MA44={ma44_now:.2f})"
+                f"{self.symbol}: {direction} setup candle (Layers 2–3 PASS) — "
+                f"awaiting Layer 4 on next candle open  (MA44={ma44_now:.2f})"
             )
 
         return None, None
@@ -503,25 +595,26 @@ class RealtimeScanner:
         ws_url     = f"wss://stream.binance.com:9443/stream?streams={stream_str}"
 
         logger.info("=" * 80)
-        logger.info("REAL-TIME CRYPTO SCANNER  —  Logic No. 2b  (MA44 Bounce)")
+        logger.info("REAL-TIME CRYPTO SCANNER  —  3-Layer Signal Logic (no sideways filter)")
         logger.info("=" * 80)
         logger.info(f"Monitoring  : {len(self.symbols)} symbols")
-        logger.info(f"Logic       : MA44 Bounce — no RSI, no crossovers")
-        logger.info(f"SHORT       : bearish candle below continuously-falling MA44 (4 candles)")
-        logger.info(f"LONG        : bullish candle above continuously-rising  MA44 (4 candles)")
-        logger.info(f"Conditions  : body strictly outside MA44 | wick >= 0.35% | dist <= 0.75%")
-        logger.info(f"Entry price : open of candle immediately after validation candle")
+        logger.info(f"Layer 2     : Cross confirm    (EMA9/EMA26 vs MA44, relaxed, last {Config.CROSS_LOOKBACK} candles)")
+        logger.info(f"Layer 3     : Setup candle     (RSI + EMA order + direction + close vs MAs)")
+        logger.info(f"Layer 4     : Trigger candle   (MA44 slope {Config.SLOPE_CANDLES}-candle + open gap)")
+        logger.info(f"SHORT RSI   : {Config.RSI_SHORT_MIN}–{Config.RSI_SHORT_MAX}  |  LONG RSI: {Config.RSI_LONG_MIN}–{Config.RSI_LONG_MAX}")
+        logger.info(f"Entry price : open of trigger candle (candle after setup)")
         logger.info(f"Cooldown    : {Config.ALERT_COOLDOWN//60}min per symbol")
         logger.info(f"Telegram    : {'ENABLED' if Config.SEND_INSTANT_ALERTS else 'DISABLED'}")
         logger.info("=" * 80)
 
         startup_msg = (
-            "🚀 <b>REAL-TIME Scanner Started — Logic No. 2b</b>\n\n"
-            "⚡ <b>MA44 BOUNCE LOGIC ACTIVE</b>\n\n"
+            "🚀 <b>REAL-TIME Scanner Started — 3-Layer Logic</b>\n\n"
+            "⚡ <b>3-LAYER SIGNAL DETECTION ACTIVE</b>\n\n"
             f"✅ Monitoring: {len(self.symbols)} crypto pairs\n"
-            "✅ No RSI | No crossovers\n"
-            "✅ Entry = open of candle after validation candle\n"
-            "✅ Cooldown: 2h30m per symbol\n\n"
+            f"✅ Layer 2: EMA cross confirmation ({Config.CROSS_LOOKBACK} candles, relaxed)\n"
+            f"✅ Layer 3: Setup candle (RSI + EMA + direction)\n"
+            f"✅ Layer 4: Trigger candle (MA44 slope + open gap)\n"
+            f"✅ Cooldown: {Config.ALERT_COOLDOWN//60}min per symbol\n\n"
             f"⏰ Started: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
         )
         # send_telegram_alert(startup_msg)
