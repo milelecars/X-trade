@@ -55,9 +55,9 @@ import logging
 import sys
 import io
 import os
-# from dotenv import load_dotenv
+from dotenv import load_dotenv
 
-# load_dotenv()
+load_dotenv()
 
 # ============================================================================
 # CONFIGURATION
@@ -98,7 +98,14 @@ class Config:
 # ============================================================================
 
 SYMBOLS = [
-    'BTCUSDT',
+    'BTCUSDT', 'ETHUSDT', 'BNBUSDT', 'SOLUSDT', 'XRPUSDT',
+    'ADAUSDT', 'AVAXUSDT', 'DOGEUSDT', 'DOTUSDT', 'MATICUSDT',
+    'LINKUSDT', 'UNIUSDT', 'LTCUSDT', 'ATOMUSDT', 'NEARUSDT',
+    'APTUSDT', 'OPUSDT', 'ARBUSDT', 'SUIUSDT', 'PEPEUSDT',
+    'SHIBUSDT', 'WLDUSDT', 'INJUSDT', 'RUNEUSDT', 'FILUSDT',
+    'AAVEUSDT', 'MKRUSDT', 'SNXUSDT', 'SANDUSDT', 'MANAUSDT',
+    'AXSUSDT', 'GALAUSDT', 'APEUSDT', 'IMXUSDT', 'FTMUSDT',
+    'ALGOUSDT', 'ICPUSDT', 'THETAUSDT', 'EGLDUSDT', 'XTZUSDT',
 ]
 
 # ============================================================================
@@ -186,9 +193,10 @@ class IndicatorEngine:
         delta  = prices.diff()
         gain   = delta.where(delta > 0, 0).rolling(window=period).mean()
         loss   = (-delta.where(delta < 0, 0)).rolling(window=period).mean()
-        rs     = gain / loss
+        rs     = gain / loss.replace(0, float('nan'))
         rsi    = 100 - (100 / (1 + rs))
-        return float(rsi.iloc[-1])
+        val    = rsi.iloc[-1]
+        return float(val) if not pd.isna(val) else 50.0
 
 # ============================================================================
 # CANDLE MANAGER
@@ -247,7 +255,7 @@ class CandleManager:
                 logger.error(f"{self.symbol}: Insufficient data ({len(candles)} bars)")
                 return False
 
-            for candle in candles:
+            for candle in candles[:-1]:  # exclude last (currently-forming) candle
                 try:
                     self.timestamps.append(int(candle[0]))
                     self.opens.append(float(candle[1]))
@@ -281,14 +289,14 @@ class CandleManager:
         candle_start = (timestamp // candle_ms) * candle_ms
 
         if not self.current_candle or candle_start > self.current_candle['timestamp']:
-            if self.current_candle:
+            candle_closed = self.current_candle is not None
+            if candle_closed:
                 self.timestamps.append(self.current_candle['timestamp'])
                 self.opens.append(self.current_candle['open'])
                 self.highs.append(self.current_candle['high'])
                 self.lows.append(self.current_candle['low'])
                 self.closes.append(self.current_candle['close'])
                 self.volumes.append(self.current_candle['volume'])
-                return True
 
             self.current_candle = {
                 'timestamp': candle_start,
@@ -298,6 +306,7 @@ class CandleManager:
                 'close': price,
                 'volume': 0
             }
+            return candle_closed
         else:
             if self.current_candle:
                 self.current_candle['high']  = max(self.current_candle['high'], price)
@@ -425,11 +434,14 @@ class CandleManager:
         if len(closes) < Config.MA_PERIOD + Config.SLOPE_CANDLES + 2:
             return None
 
+        # MA44 slope: compare current MA44 (on setup candle) vs MA44 from SLOPE_CANDLES ago
+        # Need full MA_PERIOD window shifted back by SLOPE_CANDLES
         ma44_now = IndicatorEngine.calculate_sma(closes[:-1], Config.MA_PERIOD)
+        slope_end = len(closes) - 1 - Config.SLOPE_CANDLES
         ma44_ago = IndicatorEngine.calculate_sma(
-            closes[-(Config.SLOPE_CANDLES + 2):-1], Config.MA_PERIOD
+            closes[max(0, slope_end - Config.MA_PERIOD):slope_end], Config.MA_PERIOD
         )
-        topen = opens[-1]   # trigger candle open (candle that just started)
+        topen = opens[-1]   # trigger candle open = current_candle open (stored separately)
         sopen = opens[-2]   # setup candle open
 
         if direction == 'LONG'  and ma44_now > ma44_ago and topen > sopen: return topen
@@ -581,12 +593,12 @@ class RealtimeScanner:
         if self.running:
             logger.info("Reconnecting in 5 seconds...")
             time.sleep(5)
-            self.start()
+            self.start(reconnect=True)
 
     def on_open(self, ws):
         logger.info("[OK] WebSocket connected - REAL-TIME monitoring active!")
 
-    def start(self):
+    def start(self, reconnect: bool = False):
         """Start the scanner"""
         self.running = True
 
@@ -617,7 +629,8 @@ class RealtimeScanner:
             f"✅ Cooldown: {Config.ALERT_COOLDOWN//60}min per symbol\n\n"
             f"⏰ Started: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
         )
-        # send_telegram_alert(startup_msg)
+        if not reconnect:
+            send_telegram_alert(startup_msg)
 
         self.ws = websocket.WebSocketApp(
             ws_url,
@@ -655,7 +668,7 @@ def main():
             "🛑 <b>Scanner Stopped</b>\n\n"
             f"⏰ {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
         )
-        # send_telegram_alert(shutdown_msg)
+        send_telegram_alert(shutdown_msg)
 
 
 def send_test_signal():
