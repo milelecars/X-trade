@@ -55,9 +55,11 @@ import logging
 import sys
 import io
 import os
-from dotenv import load_dotenv
-
-load_dotenv()
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass  # Not needed on Railway — env vars are set natively in the dashboard
 
 # ============================================================================
 # CONFIGURATION
